@@ -1,0 +1,216 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+    This template deploys a VPC, with a public and a private subnet in the same
+    Availability Zone. It deploys an Internet Gateway, with a default route on the
+    public subnet. It deploys a NAT Gateway (same AZ), and default routes for it in 
+    the private subnet.
+
+Parameters:
+    EnvironmentName:
+        Description: An environment name that will be prefixed to resource names
+        Type: String
+
+    VpcCIDR: 
+        Description: Please enter the IP range (CIDR notation) for this VPC
+        Type: String
+        Default: 10.192.0.0/16
+
+    PublicSubnetCIDR:
+        Description: Please enter the IP range (CIDR notation) for the public subnet
+        Type: String
+        Default: 10.192.10.0/24
+
+    PrivateSubnetCIDR:
+        Description: Please enter the IP range (CIDR notation) for the private subnet
+        Type: String
+        Default: 10.192.20.0/24
+
+    KeyName:
+      Description: EC2 Key pair name for Instance
+      Type: String
+      Default: ''
+
+Resources:
+    VPC: 
+        Type: AWS::EC2::VPC
+        Properties:
+            CidrBlock: !Ref VpcCIDR
+            Tags: 
+                - Key: Name 
+                  Value: !Ref EnvironmentName
+
+    InternetGateway:
+        Type: AWS::EC2::InternetGateway
+        Properties:
+            Tags:
+                - Key: Name
+                  Value: !Ref EnvironmentName
+
+    InternetGatewayAttachment:
+        Type: AWS::EC2::VPCGatewayAttachment
+        Properties:
+            InternetGatewayId: !Ref InternetGateway
+            VpcId: !Ref VPC
+
+    PublicSubnet: 
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VPC
+            AvailabilityZone: !Select [ 0, !GetAZs '' ]
+            CidrBlock: !Ref PublicSubnetCIDR
+            MapPublicIpOnLaunch: true
+            Tags: 
+                - Key: Name 
+                  Value: !Sub ${EnvironmentName} Public Subnet
+
+    PrivateSubnet: 
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref VPC
+            AvailabilityZone: !Select [ 0, !GetAZs '' ]
+            CidrBlock: !Ref PrivateSubnetCIDR
+            MapPublicIpOnLaunch: false
+            Tags: 
+                - Key: Name 
+                  Value: !Sub ${EnvironmentName} Private Subnet
+
+    NatEIP:
+        Type: AWS::EC2::EIP
+        Properties: 
+            Domain: vpc
+
+    NatNetworkInterfaceEIPAssociation:
+        Type: AWS::EC2::EIPAssociation
+        DependsOn: NatNetworkInterface
+        Properties:
+            AllocationId: !GetAtt NatEIP.AllocationId
+            NetworkInterfaceId: !Ref NatNetworkInterface
+
+    NatNetworkInterface:
+      Type: AWS::EC2::NetworkInterface
+      Properties:
+        SourceDestCheck: false
+        SubnetId: !Ref PublicSubnet
+        GroupSet:
+            - !GetAtt VPC.DefaultSecurityGroup
+
+    IAMFleetRole:
+        Type: AWS::IAM::Role
+        Properties: 
+            AssumeRolePolicyDocument: 
+                Version: "2012-10-17"
+                Statement:
+                    -
+                        Effect: "Allow"
+                        Principal: 
+                            Service: 
+                                - "spotfleet.amazonaws.com"
+                        Action: 
+                            - "sts:AssumeRole"
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole
+
+    SpotFleet:
+        Type: AWS::EC2::SpotFleet
+        Properties:
+            SpotFleetRequestConfigData:
+                IamFleetRole: !GetAtt [IAMFleetRole, Arn]
+                LaunchSpecifications:
+                    - 
+                        EbsOptimized: false
+                        InstanceType: t3.nano
+                        ImageId: ami-0ea87e2bfa81ca08a
+                        KeyName: !Ref KeyName
+                        NetworkInterfaces:
+                            - DeviceIndex: 0
+                              NetworkInterfaceId: !Ref NatNetworkInterface
+                            - DeviceIndex: 1
+                              SubnetId: !Ref PublicSubnet
+                        TagSpecifications:
+                            - ResourceType: instance
+                              Tags:
+                                - Key: Name 
+                                  Value: !Sub ${EnvironmentName} NAT instance
+                TargetCapacity: 1
+
+    PublicRouteTable:
+        Type: AWS::EC2::RouteTable
+        Properties: 
+            VpcId: !Ref VPC
+            Tags: 
+                - Key: Name 
+                  Value: !Sub ${EnvironmentName} Public Routes
+
+    DefaultPublicRoute: 
+        Type: AWS::EC2::Route
+        DependsOn: InternetGatewayAttachment
+        Properties: 
+            RouteTableId: !Ref PublicRouteTable
+            DestinationCidrBlock: 0.0.0.0/0
+            GatewayId: !Ref InternetGateway
+
+    PublicSubnetRouteTableAssociation:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            RouteTableId: !Ref PublicRouteTable
+            SubnetId: !Ref PublicSubnet
+
+    PrivateRouteTable:
+        Type: AWS::EC2::RouteTable
+        Properties: 
+            VpcId: !Ref VPC
+            Tags: 
+                - Key: Name 
+                  Value: !Sub ${EnvironmentName} Private Routes
+
+    DefaultPrivateRoute:
+        Type: AWS::EC2::Route
+        Properties:
+            RouteTableId: !Ref PrivateRouteTable
+            DestinationCidrBlock: 0.0.0.0/0
+            NetworkInterfaceId: !Ref NatNetworkInterface
+
+    PrivateSubnetRouteTableAssociation:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            RouteTableId: !Ref PrivateRouteTable
+            SubnetId: !Ref PrivateSubnet
+
+    HelloWorldFunction:
+        Type: AWS::Serverless::Function
+        Properties:
+            CodeUri: hello_world/
+            Handler: app.lambdaHandler
+            Runtime: nodejs8.10
+            VpcConfig:
+                SubnetIds: 
+                    - !Ref PrivateSubnet
+                SecurityGroupIds:
+                    - !GetAtt VPC.DefaultSecurityGroup
+            Policies:
+                - Version: '2012-10-17'
+                  Statement:
+                    - Effect: Allow
+                      Action:
+                          - 'ec2:CreateNetworkInterface'
+                          - 'ec2:DescribeNetworkInterfaces'
+                          - 'ec2:DeleteNetworkInterface'
+                      Resource: '*'
+
+Outputs: 
+    VPC: 
+        Description: A reference to the created VPC
+        Value: !Ref VPC
+
+    PublicSubnet:
+        Description: A reference to the public subnet
+        Value: !Ref PublicSubnet
+
+    PrivateSubnet:
+        Description: A reference to the private subnet
+        Value: !Ref PrivateSubnet
+    
+    HelloWorldFunction:
+      Description: "Hello World Lambda Function ARN"
+      Value: !GetAtt HelloWorldFunction.Arn
